@@ -3,15 +3,22 @@
 <head>
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
-    <title>Upload Input JSON</title>
+    <title>Upload Input JSON or Zipped Folder</title>
     <link rel="stylesheet" href="/static/style.css">
 </head>
 <body>
     <div class="container">
-        <h1>Upload Input JSON</h1>
+        <h1>Upload Input JSON or Zipped Folder</h1>
         <form action="/upload" method="post" enctype="multipart/form-data">
+            <label for="file">Upload Input JSON:</label>
             <input type="file" name="file" accept=".json" required>
             <button type="submit">Upload and Generate</button>
+        </form>
+        <hr>
+        <form action="/upload_zip" method="post" enctype="multipart/form-data">
+            <label for="zipfile">Upload Zipped Folder of Images:</label>
+            <input type="file" name="zipfile" accept=".zip" required>
+            <button type="submit">Analyze Zipped Folder</button>
         </form>
     </div>
 </body>

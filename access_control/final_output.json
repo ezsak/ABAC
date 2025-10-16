@@ -1,0 +1,51 @@
+{
+    "EA_1": {
+        "distribution": "Uniform",
+        "n": 1
+    },
+    "EA_2": {
+        "distribution": "Normal",
+        "mean": 0.5,
+        "variance": 0.01,
+        "n": 2
+    },
+    "SA_2": {
+        "distribution": "Poisson",
+        "lambda": 4.05,
+        "n": 20
+    },
+    "SA_3": {
+        "distribution": "Uniform",
+        "n": 5
+    },
+    "SA_1": {
+        "distribution": "Normal",
+        "mean": 0.5,
+        "variance": 0.01,
+        "n": 30
+    },
+    "OA_2": {
+        "distribution": "Normal",
+        "mean": 0.5,
+        "variance": 0.01,
+        "n": 3
+    },
+    "OA_3": {
+        "distribution": "Normal",
+        "mean": 0.5,
+        "variance": 0.01,
+        "n": 4
+    },
+    "OA_1": {
+        "distribution": "Normal",
+        "mean": 0.5,
+        "variance": 0.01,
+        "n": 2
+    },
+    "OA_4": {
+        "distribution": "Normal",
+        "mean": 0.5,
+        "variance": 0.01,
+        "n": 5
+    }
+}
