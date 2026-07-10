@@ -49,8 +49,8 @@ Optional `global_stars` field acts as a default for all attributes without expli
   "subject_distributions": [...],
   "object_distributions": [...],
   "environment_distributions": [...],
-  "accepted_rules_count": 20,
-  "denied_rules_count": 5
+  "permit_rules_count": 20,
+  "deny_rules_count": 5
 }
 ```
 
@@ -252,5 +252,5 @@ Example: `[5, [3, 2], 4, [2, 1]]` is valid
 
 ## Sample Files
 
-See `dataset/input_with_stars.json` for a complete working example.
+See `dataset/input_with_star.json` for a complete working example.
 

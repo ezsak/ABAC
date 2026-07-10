@@ -1,4 +1,5 @@
 {
+    "$schema": "https://abacsim.pythonanywhere.com/schema.json",
     "subject_size": 4,
     "object_size": 3,
     "environment_size": 2,
@@ -88,6 +89,6 @@
             "distribution": "N"
         }
     ],
-    "accepted_rules_count": 0,
-    "denied_rules_count": 4
+    "permit_rules_count": 0,
+    "deny_rules_count": 4
 }

@@ -2,6 +2,7 @@
 import configparser
 import json
 import os
+import sys
 import random
 import numpy as np
 from math import factorial,exp
@@ -28,6 +29,7 @@ import gen_rules
 
 ENV_CONFIG_INI = "ABAC_CONFIG_INI"
 ENV_OUTPUT_DIR = "ABAC_OUTPUT_DIR"
+ENABLE_MEANINGFUL_NAMES = False
 
 # config.ini: default is access_control/config.ini, but can be overridden per-job.
 config_path = os.environ.get(ENV_CONFIG_INI) or os.path.join(
@@ -48,19 +50,22 @@ os.makedirs(OUTPUT_FOLDER, exist_ok=True)
 
 # Parse attributes from config.ini
 def parse_attributes(section):
-    """
-    Parse attributes from config section.
-    Returns a dict with:
-    - count: number of attributes
-    - values: list of number of values for each attribute
-    - stars: list of number of stars for each attribute (optional, defaults to empty)
-    - distributions: list of distribution dicts
-    """
+    correlations_raw = config[section].get("correlations", "{}")
+    count = int(config[section]["count"])
+    stars_raw = config[section].get("stars", "")
+    if stars_raw.strip():
+        stars = list(map(int, stars_raw.split(",")))
+    else:
+        stars = [0] * count
+    # Defensive: ensure stars list length matches count.
+    if len(stars) != count:
+        stars = (stars + ([0] * count))[:count]
     return {
-        "count": int(config[section]["count"]),
+        "count": count,
         "values": list(map(int, config[section]["values"].split(','))),
-        "stars": list(map(int, config[section].get("stars", "0," * int(config[section]["count"])).rstrip(',').split(','))),
-        "distributions": json.loads(config[section]["distributions"])
+        "stars": stars,
+        "distributions": json.loads(config[section]["distributions"]),
+        "correlations": json.loads(correlations_raw) if correlations_raw else {},
     }
 
 subject_attributes = parse_attributes("SUBJECT_ATTRIBUTES")
@@ -145,79 +150,225 @@ def sample_truncated_normal(mean, variance, low, high):
     a, b = (low - mean) / sigma, (high - mean) / sigma
     return truncnorm.rvs(a, b, loc=mean, scale=sigma)
 
-# ---- main assignment routine ----
-def assign_values(attribute_values, distributions, entity_count,
-                  attribute_prefix, entity_prefix):
-    """
-    attribute_values: dict like {"SA_1": ["SA_1_1","SA_1_2",...], ...}
-    distributions: list of dicts, one per attribute, e.g. [{"distribution":"N"}, {"distribution":"P"}, ...]
-                   For Normal you may optionally include "mean" and "variance", but defaults are used if missing.
-                   For Poisson we IGNORE any provided lambda and compute lambda=(1+n)/2 as requested.
-    """
+def _normalize_prob_vector(probs):
+    probs = np.asarray(probs, dtype=float)
+    probs[probs < 0] = 0
+    total = probs.sum()
+    if total <= 0:
+        return np.ones_like(probs, dtype=float) / len(probs)
+    return probs / total
+
+
+def _normal_bin_probabilities(n, dist):
+    mean = float(dist.get("mean", (n + 1) / 2.0))
+    variance = float(dist.get("variance", (n / 6.0) ** 2))
+    sigma = max(np.sqrt(variance), 1e-9)
+    a = (0.0 - mean) / sigma
+    b = (float(n) - mean) / sigma
+    if hasattr(truncnorm, "cdf"):
+        cdf_edges = np.array([
+            truncnorm.cdf(float(i), a, b, loc=mean, scale=sigma) for i in range(n + 1)
+        ])
+        probs = np.diff(cdf_edges)
+        return _normalize_prob_vector(probs)
+    # Fallback for environments without scipy.stats truncnorm.cdf.
+    draws = np.array([sample_truncated_normal(mean, variance, 0.0, float(n)) for _ in range(2000)])
+    bins = np.clip(draws.astype(int), 0, n - 1)
+    counts = np.bincount(bins, minlength=n)
+    return _normalize_prob_vector(counts)
+
+
+def _build_base_sampler(distributions, attribute_values, attribute_prefix):
+    samplers = []
+    marginals = []
+    for i, dist in enumerate(distributions):
+        n = len(attribute_values[f"{attribute_prefix}_{i+1}"])
+        dtype = dist["distribution"]
+        if dtype == "N":
+            probs = _normal_bin_probabilities(n, dist)
+        elif dtype == "P":
+            lam = float(dist["lambda"])
+            probs = _normalize_prob_vector([poisson_pmf(lam, k=j + 1) for j in range(n)])
+        elif dtype == "U":
+            low_idx = max(0, int(dist.get("low", 0)))
+            high_idx = min(n, int(dist.get("high", n)))
+            if high_idx <= low_idx:
+                low_idx, high_idx = 0, n
+            probs = np.zeros(n, dtype=float)
+            probs[low_idx:high_idx] = 1.0
+            probs = _normalize_prob_vector(probs)
+        else:
+            raise ValueError(f"Unsupported distribution type: {dtype}")
+        marginals.append(probs)
+        samplers.append(np.arange(n))
+    return samplers, marginals
+
+
+def _sample_from_probs(probs):
+    return np.random.choice(np.arange(len(probs)), p=probs)
+
+
+def _sample_rows_from_prob_matrix(prob_matrix):
+    cdf = np.cumsum(prob_matrix, axis=1)
+    r = np.random.rand(prob_matrix.shape[0], 1)
+    return (cdf < r).sum(axis=1)
+
+
+def _normalize_joint_target(pair, cardinality_a, cardinality_b, marginal_a, marginal_b):
+    target = pair.get("target", {})
+    if "joint_table" in target:
+        table = np.array(target["joint_table"], dtype=float)
+        if table.shape != (cardinality_a, cardinality_b):
+            raise ValueError("Correlation joint_table dimensions do not match attribute domains")
+        return _normalize_prob_vector(table.reshape(-1)).reshape(cardinality_a, cardinality_b)
+    if "cramers_v" in target:
+        strength = float(target.get("cramers_v", 0.0))
+        base = np.outer(marginal_a, marginal_b)
+        diagonal = np.zeros_like(base)
+        diag_len = min(cardinality_a, cardinality_b)
+        for d in range(diag_len):
+            diagonal[d, d] = 1.0 / diag_len
+        table = (1.0 - strength) * base + strength * diagonal
+        return _normalize_prob_vector(table.reshape(-1)).reshape(cardinality_a, cardinality_b)
+    raise ValueError("Each correlation pair target must define joint_table or cramers_v")
+
+
+def _js_divergence(p, q):
+    p = _normalize_prob_vector(p)
+    q = _normalize_prob_vector(q)
+    m = 0.5 * (p + q)
+    def _kl(a, b):
+        eps = 1e-12
+        mask = a > 0
+        return np.sum(a[mask] * np.log((a[mask] + eps) / (b[mask] + eps)))
+    return 0.5 * _kl(p, m) + 0.5 * _kl(q, m)
+
+
+def _compute_pair_l1(samples, idx_a, idx_b, card_a, card_b, target_joint):
+    observed = np.zeros((card_a, card_b), dtype=float)
+    np.add.at(observed, (samples[:, idx_a], samples[:, idx_b]), 1.0)
+    observed /= max(len(samples), 1)
+    return float(np.abs(observed - target_joint).sum())
+
+
+def _compute_metrics(samples, base_marginals, pair_specs):
+    marginal_error = 0.0
+    for idx, base_prob in enumerate(base_marginals):
+        observed = np.bincount(samples[:, idx], minlength=len(base_prob))
+        observed = observed / max(len(samples), 1)
+        marginal_error += _js_divergence(observed, base_prob)
+    pair_error = 0.0
+    for spec in pair_specs:
+        pair_error += _compute_pair_l1(
+            samples,
+            spec["idx_a"],
+            spec["idx_b"],
+            spec["card_a"],
+            spec["card_b"],
+            spec["target_joint"],
+        )
+    if pair_specs:
+        pair_error /= len(pair_specs)
+    if base_marginals:
+        marginal_error /= len(base_marginals)
+    return marginal_error, pair_error
+
+
+def assign_values(attribute_values, distributions, entity_count, attribute_prefix, entity_prefix, correlations=None, sampling_config=None):
+    correlations = correlations or {}
+    sampling_config = sampling_config or {}
+    _, base_marginals = _build_base_sampler(distributions, attribute_values, attribute_prefix)
+    attr_count = len(base_marginals)
+    samples = np.zeros((entity_count, attr_count), dtype=int)
+
+    # Independent initialization (vectorized).
+    for idx, probs in enumerate(base_marginals):
+        samples[:, idx] = np.random.choice(np.arange(len(probs)), size=entity_count, p=probs)
+
+    # Pairwise soft calibration (hybrid phase-1 implementation).
+    pair_specs = []
+    for pair in correlations.get("pairs", []):
+        idx_a = int(pair["attr_a"]) - 1
+        idx_b = int(pair["attr_b"]) - 1
+        if idx_a < 0 or idx_b < 0 or idx_a >= attr_count or idx_b >= attr_count or idx_a == idx_b:
+            continue
+        card_a = len(base_marginals[idx_a])
+        card_b = len(base_marginals[idx_b])
+        target_joint = _normalize_joint_target(
+            pair,
+            card_a,
+            card_b,
+            base_marginals[idx_a],
+            base_marginals[idx_b],
+        )
+        pair_specs.append({
+            "idx_a": idx_a,
+            "idx_b": idx_b,
+            "card_a": card_a,
+            "card_b": card_b,
+            "target_joint": target_joint,
+            "weight": float(pair.get("weight", 1.0)),
+        })
+
+    alpha = float(sampling_config.get("alpha", 0.8))
+    beta = float(sampling_config.get("beta", 0.2))
+    max_iters = int(sampling_config.get("max_calibration_iters", 25))
+    marginal_tolerance = float(sampling_config.get("marginal_tolerance", 0.02))
+    pair_tolerance = float(sampling_config.get("pair_tolerance", 0.15))
+
+    diagnostics = {
+        "mode": "independent",
+        "iterations": 0,
+        "marginal_error": 0.0,
+        "pair_error": 0.0,
+        "marginal_tolerance": marginal_tolerance,
+        "pair_tolerance": pair_tolerance,
+    }
+    if pair_specs and entity_count > 0:
+        diagnostics["mode"] = "pairwise_soft_calibrated"
+        marginal_mix = alpha / max(alpha + beta, 1e-9)
+        correlation_mix = 1.0 - marginal_mix
+        for iteration in range(max_iters):
+            for spec in pair_specs:
+                idx_a = spec["idx_a"]
+                idx_b = spec["idx_b"]
+                target_joint = spec["target_joint"]
+                cond_b_given_a = np.zeros_like(target_joint)
+                row_sums = target_joint.sum(axis=1, keepdims=True)
+                np.divide(target_joint, row_sums, out=cond_b_given_a, where=row_sums > 0)
+                per_row = cond_b_given_a[samples[:, idx_a]]
+                blended = correlation_mix * per_row + marginal_mix * base_marginals[idx_b][None, :]
+                blended = np.apply_along_axis(_normalize_prob_vector, 1, blended)
+                samples[:, idx_b] = _sample_rows_from_prob_matrix(blended)
+
+                # Symmetric update for A given B to avoid directional bias.
+                cond_a_given_b = np.zeros_like(target_joint.T)
+                col_sums = target_joint.sum(axis=0, keepdims=True)
+                np.divide(target_joint.T, col_sums, out=cond_a_given_b, where=col_sums > 0)
+                per_row_a = cond_a_given_b[samples[:, idx_b]]
+                blended_a = correlation_mix * per_row_a + marginal_mix * base_marginals[idx_a][None, :]
+                blended_a = np.apply_along_axis(_normalize_prob_vector, 1, blended_a)
+                samples[:, idx_a] = _sample_rows_from_prob_matrix(blended_a)
+            diagnostics["iterations"] = iteration + 1
+            m_err, p_err = _compute_metrics(samples, base_marginals, pair_specs)
+            diagnostics["marginal_error"] = round(float(m_err), 6)
+            diagnostics["pair_error"] = round(float(p_err), 6)
+            if m_err <= marginal_tolerance and p_err <= pair_tolerance:
+                break
+    else:
+        m_err, p_err = _compute_metrics(samples, base_marginals, [])
+        diagnostics["marginal_error"] = round(float(m_err), 6)
+        diagnostics["pair_error"] = round(float(p_err), 6)
+
     entity_values = {}
-
-    for entity in range(1, entity_count + 1):
-        key = f"{entity_prefix}_{entity}"
-        entity_values[key] = []
-
-        for i, dist in enumerate(distributions):
+    for entity in range(entity_count):
+        key = f"{entity_prefix}_{entity + 1}"
+        row = []
+        for i in range(attr_count):
             values = attribute_values[f"{attribute_prefix}_{i+1}"]
-            n = len(values)
-
-            if dist["distribution"] == "N":
-                # use defaults unless user provided overrides
-                mean = dist.get("mean", (n+1)/2.0)
-                # mean=0.5
-                # variance = dist.get("variance", 0.01)
-                variance = dist.get("variance", (n/6.0)**2)
-
-                # variance=0.01
-                # sigma = np.sqrt(variance)
-                x = sample_truncated_normal(mean=mean, variance=variance, low=0.0, high=float(n))
-
-                # map continuous x in [0,1] to one of n equal bins [0,1/n),[1/n,2/n),...
-                # map x ∈ [0,n] to bin k: choose a_k if x ∈ [k-1, k)
-                # 0-based index: idx = floor(x), then clamp to [0, n-1]
-                idx = int(x)
-                if idx >= n:    # rare edge if x == 1.0
-                    idx = n - 1
-                entity_values[key].append(values[idx])
-
-            elif dist["distribution"] == "P":
-                # λ set to middle of 1..n 
-                lam = dist["lambda"]
-
-                # compute (truncated) weights for k = 1..n (attribute j corresponds to k=j+1)
-                probs = np.array([poisson_pmf(lam, k=j+1) for j in range(n)], dtype=float)
-
-                # normalize so they sum to 1 (this is the "scale up the prob sum to 1" step)
-                probs /= probs.sum()
-
-                # sample index according to these weights
-                idx = np.random.choice(np.arange(n), p=probs)
-                entity_values[key].append(values[idx])
-
-            elif dist["distribution"] == "U":
-                # Uniform distribution
-                low_idx = dist.get("low", 0)
-                high_idx = dist.get("high", n)
-                
-                # Ensure integer bounds and clamp
-                low_idx = max(0, int(low_idx))
-                high_idx = min(n, int(high_idx))
-                
-                if high_idx <= low_idx:
-                    # Fallback to full range if invalid
-                    low_idx = 0
-                    high_idx = n
-                
-                idx = np.random.choice(np.arange(low_idx, high_idx))
-                entity_values[key].append(values[idx])
-
-            else:
-                raise ValueError(f"Unsupported distribution type: {dist['distribution']}")
-
-    return entity_values
+            row.append(values[int(samples[entity, i])])
+        entity_values[key] = row
+    return entity_values, diagnostics
 
 
 # # Assign values to subjects, objects, and environments
@@ -265,10 +416,30 @@ n3 = int(config["NUMBERS"]["n3"])
 n4 = int(config["NUMBERS"]["n4"])
 n5 = int(config["NUMBERS"]["n5"])
 n6 = int(config["NUMBERS"]["n6"])
+seed_raw = config["NUMBERS"].get("seed", "").strip()
+if seed_raw:
+    seed = int(seed_raw)
+    random.seed(seed)
+    np.random.seed(seed)
+else:
+    seed = None
+sampling_config = json.loads(config.get("SAMPLING", "config", fallback="{}"))
 
-SV = assign_values(SAV, subject_attributes["distributions"], n1, "SA", "S")
-OV = assign_values(OAV, object_attributes["distributions"], n2, "OA", "O")
-EV = assign_values(EAV, environment_attributes["distributions"], n3, "EA", "E")
+SV, subject_diag = assign_values(
+    SAV, subject_attributes["distributions"], n1, "SA", "S",
+    correlations=subject_attributes.get("correlations", {}),
+    sampling_config=sampling_config,
+)
+OV, object_diag = assign_values(
+    OAV, object_attributes["distributions"], n2, "OA", "O",
+    correlations=object_attributes.get("correlations", {}),
+    sampling_config=sampling_config,
+)
+EV, environment_diag = assign_values(
+    EAV, environment_attributes["distributions"], n3, "EA", "E",
+    correlations=environment_attributes.get("correlations", {}),
+    sampling_config=sampling_config,
+)
 
 # Generate users, objects, and environments
 S = [f"S_{i}" for i in range(1, n1 + 1)]
@@ -308,31 +479,50 @@ output_data["EAV"] = EAV
 output_data["SV"] = SV
 output_data["OV"] = OV
 output_data["EV"] = EV
+output_data["generation_diagnostics"] = {
+    "seed": seed,
+    "sampling_config": sampling_config,
+    "subject": subject_diag,
+    "object": object_diag,
+    "environment": environment_diag,
+}
 
 
 #############################
 
-# Generate accepted and denied rules
-accepted_rules_count = int(config["RULES"]["accepted_rules_count"])
-denied_rules_count = int(config["RULES"]["denied_rules_count"])
+# Generate permit and deny rules
+permit_rules_count = int(config["RULES"]["permit_rules_count"])
+deny_rules_count = int(config["RULES"]["deny_rules_count"])
 
-accepted_rules = gen_rules.generate_rules_2(
-    accepted_rules_count, n4, n5, n6, SV, OV, EV,
-    subject_stars=subject_attributes["stars"],
-    object_stars=object_attributes["stars"],
-    environment_stars=environment_attributes["stars"]
-) if accepted_rules_count > 0 else []
+permit_rules = gen_rules.generate_rules_2(
+    permit_rules_count,
+    n4,
+    n5,
+    n6,
+    SV,
+    OV,
+    EV,
+    subject_stars=subject_attributes.get("stars"),
+    object_stars=object_attributes.get("stars"),
+    environment_stars=environment_attributes.get("stars"),
+) if permit_rules_count > 0 else []
 
-denied_rules = gen_rules.generate_rules_2(
-    denied_rules_count, n4, n5, n6, SV, OV, EV,
-    subject_stars=subject_attributes["stars"],
-    object_stars=object_attributes["stars"],
-    environment_stars=environment_attributes["stars"]
-) if denied_rules_count > 0 else []
+deny_rules = gen_rules.generate_rules_2(
+    deny_rules_count,
+    n4,
+    n5,
+    n6,
+    SV,
+    OV,
+    EV,
+    subject_stars=subject_attributes.get("stars"),
+    object_stars=object_attributes.get("stars"),
+    environment_stars=environment_attributes.get("stars"),
+) if deny_rules_count > 0 else []
 
 # Integrate generated rules into output.json as well
-output_data["accepted_rules"] = accepted_rules
-output_data["denied_rules"] = denied_rules
+output_data["permit_rules"] = permit_rules
+output_data["deny_rules"] = deny_rules
 
 with open(os.path.join(OUTPUT_FOLDER, 'output.json'), 'w') as f:
     json.dump(output_data, f, indent=4)
@@ -342,6 +532,87 @@ with open(os.path.join(OUTPUT_FOLDER, 'output.json'), 'w') as f:
 #         file.write(rule + "\n")
 
 print("Output generated successfully.")
+
+if not ENABLE_MEANINGFUL_NAMES:
+    # Generate only the indexed outputs and skip readable-name generation.
+    A = [[[0] * n3 for _ in range(n2)] for _ in range(n1)]
+
+    no_of_ones = 0
+
+    def satisfies_rule(rule, SA1, OA1, EA1):
+        rule_parts = rule.split(", ")
+        for part in rule_parts:
+            key, value = part.split(" = ")
+            if key.startswith("SA_") and value not in SA1 and value != '*':
+                return False
+            if key.startswith("OA_") and value not in OA1 and value != '*':
+                return False
+            if key.startswith("EA_") and value not in EA1 and value != '*':
+                return False
+        return True
+
+    def fill_matrix_with_rules(A, SV, OV, EV, permit_rules, deny_rules, n1, n2, n3):
+        global no_of_ones
+
+        has_permit = len(permit_rules) > 0
+        has_deny = len(deny_rules) > 0
+
+        for i in range(n1):
+            for j in range(n2):
+                for k in range(n3):
+                    SA1 = SV[f"S_{i + 1}"]
+                    OA1 = OV[f"O_{j + 1}"]
+                    EA1 = EV[f"E_{k + 1}"]
+
+                    matches_permit = any(satisfies_rule(rule, SA1, OA1, EA1) for rule in permit_rules) if has_permit else False
+                    matches_deny = any(satisfies_rule(rule, SA1, OA1, EA1) for rule in deny_rules) if has_deny else False
+
+                    if not has_permit and not has_deny:
+                        A[i][j][k] = 0
+                    elif has_permit and not has_deny:
+                        A[i][j][k] = 1 if matches_permit else 0
+                    elif not has_permit and has_deny:
+                        A[i][j][k] = 0 if matches_deny else 1
+                    else:
+                        A[i][j][k] = 1 if (matches_permit and not matches_deny) else 0
+
+                    no_of_ones += A[i][j][k]
+
+    fill_matrix_with_rules(A, SV, OV, EV, permit_rules, deny_rules, n1, n2, n3)
+    print("No. of ones in ACM : ", no_of_ones)
+
+    with open(os.path.join(OUTPUT_FOLDER, "ACM.txt"), "w") as file:
+        for i in range(n1):
+            for row in A[i]:
+                file.write(" ".join(map(str, row)) + "\n")
+            file.write("\n")
+
+    def prepare_access_data(S, O, E, SV, OV, EV, A):
+        access_data = []
+        for i in range(len(S)):
+            for j in range(len(O)):
+                for k in range(len(E)):
+                    subject = S[i]
+                    obj = O[j]
+                    env = E[k]
+                    T = SV[subject] + OV[obj] + EV[env] + [A[i][j][k]]
+                    access_data.append(T)
+        return access_data
+
+    access_data = prepare_access_data(S, O, E, SV, OV, EV, A)
+    with open(os.path.join(OUTPUT_FOLDER, "access_data.txt"), "w") as file:
+        for row in access_data:
+            file.write(" ".join(map(str, row)) + "\n")
+
+    print("Skipping meaningful-name generation and related output files.")
+    print("✓ Regular access_data written to access_data.txt")
+    print("\n" + "=" * 60)
+    print("SUMMARY OF GENERATED FILES")
+    print("=" * 60)
+    print("✓ output.json - Regular ABAC data")
+    print("✓ access_data.txt - Regular access control data")
+    print("✓ ACM.txt - Access Control Matrix")
+    sys.exit(0)
 
 
 
@@ -488,9 +759,9 @@ def convert_rules_to_domain_format(rules, subject_attrs, object_attrs, environme
     
     return converted_rules
 
-# Convert accepted and denied rules to healthcare format
-accepted_healthcare_rules = convert_rules_to_domain_format(
-    accepted_rules,
+# Convert permit and deny rules to healthcare format
+permit_healthcare_rules = convert_rules_to_domain_format(
+    permit_rules,
     healthcare_output_format["SA_HC"],
     healthcare_output_format["OA_HC"],
     healthcare_output_format["EA_HC"],
@@ -499,8 +770,8 @@ accepted_healthcare_rules = convert_rules_to_domain_format(
     healthcare_output_format["EAV_HC"]
 )
 
-denied_healthcare_rules = convert_rules_to_domain_format(
-    denied_rules,
+deny_healthcare_rules = convert_rules_to_domain_format(
+    deny_rules,
     healthcare_output_format["SA_HC"],
     healthcare_output_format["OA_HC"],
     healthcare_output_format["EA_HC"],
@@ -509,12 +780,12 @@ denied_healthcare_rules = convert_rules_to_domain_format(
     healthcare_output_format["EAV_HC"]
 )
 
-print(f"✓ Accepted rules converted to healthcare format ({len(accepted_healthcare_rules)} rules)")
-print(f"✓ Denied rules converted to healthcare format ({len(denied_healthcare_rules)} rules)")
+print(f"✓ Permit rules converted to healthcare format ({len(permit_healthcare_rules)} rules)")
+print(f"✓ Deny rules converted to healthcare format ({len(deny_healthcare_rules)} rules)")
 print(f"  Example healthcare rules:")
-for rule in accepted_healthcare_rules[:1]:
+for rule in permit_healthcare_rules[:1]:
     print(f"    {rule[:100]}...")
-for rule in denied_healthcare_rules[:1]:
+for rule in deny_healthcare_rules[:1]:
     print(f"    {rule[:100]}...")
 
 # ==================== CONVERT ACCESS_DATA TO HEALTHCARE FORMAT ====================
@@ -538,18 +809,18 @@ def satisfies_rule(rule, SA1, OA1, EA1):
             return False
     return True
 
-def fill_matrix_with_rules(A, SV, OV, EV, accepted_rules, denied_rules, n1, n2, n3):
+def fill_matrix_with_rules(A, SV, OV, EV, permit_rules, deny_rules, n1, n2, n3):
     """
     Fill ACM with precedence logic:
-    - If both accepted_rules = 0 and denied_rules = 0: everything is denied (acm = 0)
-    - If accepted_rules > 0 and denied_rules = 0: current behavior (acm = 1 if matches accepted, else 0)
-    - If accepted_rules = 0 and denied_rules > 0: acm = 0 if matches denied, else 1
-    - If both > 0: accepted rules take precedence (if matches both, acm = 1; if matches neither, acm = 0)
+    - If both permit_rules = 0 and deny_rules = 0: everything is denied (acm = 0)
+    - If permit_rules > 0 and deny_rules = 0: current behavior (acm = 1 if matches permit, else 0)
+    - If permit_rules = 0 and deny_rules > 0: acm = 0 if matches deny, else 1
+    - If both > 0: permit rules take precedence (if matches both, acm = 1; if matches neither, acm = 0)
     """
     global no_of_ones
     
-    has_accepted = len(accepted_rules) > 0
-    has_denied = len(denied_rules) > 0
+    has_permit = len(permit_rules) > 0
+    has_deny = len(deny_rules) > 0
     
     for i in range(n1):
         for j in range(n2):
@@ -558,27 +829,27 @@ def fill_matrix_with_rules(A, SV, OV, EV, accepted_rules, denied_rules, n1, n2, 
                 OA1 = OV[f"O_{j + 1}"]
                 EA1 = EV[f"E_{k + 1}"]
                 
-                matches_accepted = any(satisfies_rule(rule, SA1, OA1, EA1) for rule in accepted_rules) if has_accepted else False
-                matches_denied = any(satisfies_rule(rule, SA1, OA1, EA1) for rule in denied_rules) if has_denied else False
+                matches_permit = any(satisfies_rule(rule, SA1, OA1, EA1) for rule in permit_rules) if has_permit else False
+                matches_deny = any(satisfies_rule(rule, SA1, OA1, EA1) for rule in deny_rules) if has_deny else False
                 
                 # Apply precedence logic
-                if not has_accepted and not has_denied:
+                if not has_permit and not has_deny:
                     # Case 1: Both 0 - everything denied
                     A[i][j][k] = 0
-                elif has_accepted and not has_denied:
-                    # Case 2: Only accepted rules - current behavior
-                    A[i][j][k] = 1 if matches_accepted else 0
-                elif not has_accepted and has_denied:
-                    # Case 3: Only denied rules - inverse logic
-                    A[i][j][k] = 0 if matches_denied else 1
+                elif has_permit and not has_deny:
+                    # Case 2: Only permit rules - current behavior
+                    A[i][j][k] = 1 if matches_permit else 0
+                elif not has_permit and has_deny:
+                    # Case 3: Only deny rules - inverse logic
+                    A[i][j][k] = 0 if matches_deny else 1
                 else:
                     # Case 4: Both accepted and denied - accepted takes precedence
                     # 1 is matched only when it is accepted and does not match deny
-                    A[i][j][k] = 1 if (matches_accepted and not matches_denied) else 0
+                    A[i][j][k] = 1 if (matches_permit and not matches_deny) else 0
                 
                 no_of_ones += A[i][j][k]
 
-fill_matrix_with_rules(A, SV, OV, EV, accepted_rules, denied_rules, n1, n2, n3)
+fill_matrix_with_rules(A, SV, OV, EV, permit_rules, deny_rules, n1, n2, n3)
 print("No. of ones in ACM : ", no_of_ones)
 
 # Write ACM to ACM.txt
@@ -685,9 +956,9 @@ output_data_hc["SV_HC"] = healthcare_output_format["SV_HC"]
 output_data_hc["OV_HC"] = healthcare_output_format["OV_HC"]
 output_data_hc["EV_HC"] = healthcare_output_format["EV_HC"]
 
-# Append healthcare rules (both accepted and denied)
-output_data_hc["accepted_rules_HC"] = accepted_healthcare_rules
-output_data_hc["denied_rules_HC"] = denied_healthcare_rules
+# Append healthcare rules (both permit and deny)
+output_data_hc["permit_rules_HC"] = permit_healthcare_rules
+output_data_hc["deny_rules_HC"] = deny_healthcare_rules
 
 print(f"✓ Healthcare data prepared successfully")
 print(f"  Example SV_HC mapping (actual names with attribute values):")
@@ -781,9 +1052,8 @@ print(f"  Environments: {len(university_output_format['E_UNI'])} ({', '.join(uni
 
 # Convert rules to university format
 
-# Convert rules to university format
 university_rules = convert_rules_to_domain_format(
-    accepted_rules,
+    permit_rules,
     university_output_format["SA_UNI"],
     university_output_format["OA_UNI"],
     university_output_format["EA_UNI"],
@@ -792,8 +1062,8 @@ university_rules = convert_rules_to_domain_format(
     university_output_format["EAV_UNI"]
 )
 
-denied_university_rules = convert_rules_to_domain_format(
-    denied_rules,
+deny_university_rules = convert_rules_to_domain_format(
+    deny_rules,
     university_output_format["SA_UNI"],
     university_output_format["OA_UNI"],
     university_output_format["EA_UNI"],
@@ -802,12 +1072,12 @@ denied_university_rules = convert_rules_to_domain_format(
     university_output_format["EAV_UNI"]
 )
 
-print(f"✓ Accepted rules converted to university format ({len(university_rules)} rules)")
-print(f"✓ Denied rules converted to university format ({len(denied_university_rules)} rules)")
+print(f"✓ Permit rules converted to university format ({len(university_rules)} rules)")
+print(f"✓ Deny rules converted to university format ({len(deny_university_rules)} rules)")
 print(f"  Example university rules:")
 for rule in university_rules[:1]:
     print(f"    {rule[:100]}...")
-for rule in denied_university_rules[:1]:
+for rule in deny_university_rules[:1]:
     print(f"    {rule[:100]}...")
 
 # Convert access_data to university format
@@ -874,9 +1144,9 @@ output_data_uni["SV_UNI"] = university_output_format["SV_UNI"]
 output_data_uni["OV_UNI"] = university_output_format["OV_UNI"]
 output_data_uni["EV_UNI"] = university_output_format["EV_UNI"]
 
-# Append university rules (both accepted and denied)
-output_data_uni["accepted_rules_UNI"] = university_rules
-output_data_uni["denied_rules_UNI"] = denied_university_rules
+# Append university rules (both permit and deny)
+output_data_uni["permit_rules_UNI"] = university_rules
+output_data_uni["deny_rules_UNI"] = deny_university_rules
 
 print(f"✓ University data prepared successfully")
 print(f"  Example SV_UNI mapping (actual names with attribute values):")

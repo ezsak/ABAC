@@ -5,6 +5,7 @@ description = "Add your description here"
 readme = "README.md"
 requires-python = ">=3.11"
 dependencies = [
+    "faker>=40.8.0",
     "flask==2.3.2",
     "google-genai",
     "matplotlib>=3.10.8",
@@ -14,4 +15,5 @@ dependencies = [
     "python-dotenv>=1.2.1",
     "requests>=2.32.5",
     "scipy>=1.16.3",
+    "gunicorn>=23.0.0",
 ]

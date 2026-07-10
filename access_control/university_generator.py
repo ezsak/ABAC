@@ -4,7 +4,7 @@ import re
 import time
 from typing import Dict, List, Any
 from dotenv import load_dotenv
-import google.generativeai as genai
+from google import genai
 from faker import Faker
 
 load_dotenv()
@@ -33,6 +33,17 @@ def extract_attribute_counts(raw_values: List) -> List[int]:
 # Initialize Faker
 fake = Faker()
 
+class GeminiWrapper:
+    def __init__(self, client, model_name):
+        self.client = client
+        self.model_name = model_name
+        
+    def generate_content(self, prompt):
+        return self.client.models.generate_content(
+            model=self.model_name,
+            contents=prompt
+        )
+
 # Configure Gemini API
 def initialize_gemini(api_key: str = None):
     """Initialize Gemini API with your API key."""
@@ -42,8 +53,8 @@ def initialize_gemini(api_key: str = None):
     if not api_key:
         raise ValueError("GEMINI_API_KEY environment variable not set")
     
-    genai.configure(api_key=api_key)
-    return genai.GenerativeModel("gemini-2.5-flash")
+    client = genai.Client(api_key=api_key)
+    return GeminiWrapper(client, "gemini-2.5-flash")
 
 def extract_json_from_response(text: str) -> Dict:
     """Extract JSON from response text with better error handling."""

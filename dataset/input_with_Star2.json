@@ -75,6 +75,6 @@
             "lambda": 1
         }
     ],
-    "accepted_rules_count": 20,
-    "denied_rules_count": 5
+    "permit_rules_count": 20,
+    "deny_rules_count": 5
 }

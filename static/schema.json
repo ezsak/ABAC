@@ -1,0 +1,285 @@
+{
+    "$schema": "http://json-schema.org/draft-07/schema#",
+    "title": "MuSimA ABAC Input Schema",
+    "type": "object",
+    "properties": {
+        "subject_size": {
+            "type": "integer",
+            "minimum": 1
+        },
+        "object_size": {
+            "type": "integer",
+            "minimum": 1
+        },
+        "environment_size": {
+            "type": "integer",
+            "minimum": 1
+        },
+        "global_stars": {
+            "type": "integer",
+            "minimum": 0
+        },
+        "permit_rules_count": {
+            "type": "integer",
+            "minimum": 0
+        },
+        "deny_rules_count": {
+            "type": "integer",
+            "minimum": 0
+        },
+        "subject_attributes_count": {
+            "type": "integer",
+            "minimum": 1
+        },
+        "object_attributes_count": {
+            "type": "integer",
+            "minimum": 1
+        },
+        "environment_attributes_count": {
+            "type": "integer",
+            "minimum": 1
+        },
+        "subject_attributes_values": {
+            "type": "array",
+            "items": {
+                "oneOf": [
+                    {
+                        "type": "integer",
+                        "minimum": 1
+                    },
+                    {
+                        "type": "array",
+                        "items": [
+                            {
+                                "type": "integer",
+                                "minimum": 1
+                            },
+                            {
+                                "type": "integer",
+                                "minimum": 0
+                            }
+                        ],
+                        "minItems": 2,
+                        "maxItems": 2
+                    }
+                ]
+            }
+        },
+        "object_attributes_values": {
+            "type": "array",
+            "items": {
+                "oneOf": [
+                    {
+                        "type": "integer",
+                        "minimum": 1
+                    },
+                    {
+                        "type": "array",
+                        "items": [
+                            {
+                                "type": "integer",
+                                "minimum": 1
+                            },
+                            {
+                                "type": "integer",
+                                "minimum": 0
+                            }
+                        ],
+                        "minItems": 2,
+                        "maxItems": 2
+                    }
+                ]
+            }
+        },
+        "environment_attributes_values": {
+            "type": "array",
+            "items": {
+                "oneOf": [
+                    {
+                        "type": "integer",
+                        "minimum": 1
+                    },
+                    {
+                        "type": "array",
+                        "items": [
+                            {
+                                "type": "integer",
+                                "minimum": 1
+                            },
+                            {
+                                "type": "integer",
+                                "minimum": 0
+                            }
+                        ],
+                        "minItems": 2,
+                        "maxItems": 2
+                    }
+                ]
+            }
+        },
+        "subject_distributions": {
+            "$ref": "#/definitions/distribution_array"
+        },
+        "object_distributions": {
+            "$ref": "#/definitions/distribution_array"
+        },
+        "environment_distributions": {
+            "$ref": "#/definitions/distribution_array"
+        },
+        "seed": {
+            "type": "integer"
+        },
+        "sampling_config": {
+            "$ref": "#/definitions/sampling_config"
+        },
+        "correlations": {
+            "$ref": "#/definitions/correlations"
+        }
+    },
+    "required": [
+        "subject_size",
+        "object_size",
+        "environment_size",
+        "permit_rules_count",
+        "deny_rules_count"
+    ],
+    "definitions": {
+        "distribution_array": {
+            "type": "array",
+            "items": {
+                "type": "object",
+                "properties": {
+                    "distribution": {
+                        "type": "string",
+                        "enum": [
+                            "N",
+                            "P",
+                            "U"
+                        ]
+                    },
+                    "mean": {
+                        "type": "number"
+                    },
+                    "variance": {
+                        "type": "number",
+                        "minimum": 0
+                    },
+                    "lambda": {
+                        "type": "number",
+                        "minimum": 0
+                    }
+                },
+                "required": [
+                    "distribution"
+                ]
+            }
+        },
+        "sampling_config": {
+            "type": "object",
+            "properties": {
+                "alpha": {
+                    "type": "number",
+                    "minimum": 0
+                },
+                "beta": {
+                    "type": "number",
+                    "minimum": 0
+                },
+                "max_calibration_iters": {
+                    "type": "integer",
+                    "minimum": 0
+                },
+                "marginal_tolerance": {
+                    "type": "number",
+                    "minimum": 0
+                },
+                "pair_tolerance": {
+                    "type": "number",
+                    "minimum": 0
+                }
+            }
+        },
+        "correlations": {
+            "type": "object",
+            "properties": {
+                "subject": {
+                    "$ref": "#/definitions/entity_correlation"
+                },
+                "object": {
+                    "$ref": "#/definitions/entity_correlation"
+                },
+                "environment": {
+                    "$ref": "#/definitions/entity_correlation"
+                }
+            }
+        },
+        "entity_correlation": {
+            "type": "object",
+            "properties": {
+                "pairs": {
+                    "type": "array",
+                    "items": {
+                        "$ref": "#/definitions/pair_correlation"
+                    }
+                }
+            }
+        },
+        "pair_correlation": {
+            "type": "object",
+            "properties": {
+                "attr_a": {
+                    "type": "integer",
+                    "minimum": 1
+                },
+                "attr_b": {
+                    "type": "integer",
+                    "minimum": 1
+                },
+                "weight": {
+                    "type": "number",
+                    "minimum": 0,
+                    "maximum": 1
+                },
+                "target": {
+                    "type": "object",
+                    "oneOf": [
+                        {
+                            "required": [
+                                "joint_table"
+                            ],
+                            "properties": {
+                                "joint_table": {
+                                    "type": "array",
+                                    "items": {
+                                        "type": "array",
+                                        "items": {
+                                            "type": "number",
+                                            "minimum": 0
+                                        }
+                                    }
+                                }
+                            }
+                        },
+                        {
+                            "required": [
+                                "cramers_v"
+                            ],
+                            "properties": {
+                                "cramers_v": {
+                                    "type": "number",
+                                    "minimum": 0,
+                                    "maximum": 1
+                                }
+                            }
+                        }
+                    ]
+                }
+            },
+            "required": [
+                "attr_a",
+                "attr_b",
+                "target"
+            ]
+        }
+    }
+}
